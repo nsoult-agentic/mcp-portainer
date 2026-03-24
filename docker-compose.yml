@@ -54,5 +54,5 @@ services:
       - SECRETS_DIR=/secrets
       - PORT=8900
       - PORTAINER_URL=http://host.docker.internal:9000
-      - PORTAINER_ENV_ID=1
+      - PORTAINER_ENV_ID=2
       # NEVER put secrets here — API key is read from /secrets/api-key

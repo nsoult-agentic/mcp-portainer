@@ -23,7 +23,7 @@ import { z } from "zod";
 const PORT = Number(process.env["PORT"]) || 8900;
 const SECRETS_DIR = process.env["SECRETS_DIR"] || "/secrets";
 const PORTAINER_URL = process.env["PORTAINER_URL"] || "http://host.docker.internal:9000";
-const ENVIRONMENT_ID = process.env["PORTAINER_ENV_ID"] || "1";
+const ENVIRONMENT_ID = process.env["PORTAINER_ENV_ID"] || "2";
 
 // Read API key from file (NEVER from env var)
 function loadApiKey(): string {
