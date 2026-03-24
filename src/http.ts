@@ -54,8 +54,10 @@ async function portainerGet(path: string): Promise<unknown> {
     headers: { "X-API-Key": API_KEY },
   });
   if (!res.ok) {
-    // Generic error — never expose headers, URLs, or response bodies
-    throw new Error(`Portainer API request failed (${res.status})`);
+    const body = await res.text().catch(() => "(unreadable)");
+    throw new Error(
+      `Portainer API ${res.status} on GET /api${path}: ${body.slice(0, 200)}`
+    );
   }
   return res.json();
 }
@@ -67,7 +69,10 @@ async function portainerPost(path: string): Promise<unknown> {
     headers: { "X-API-Key": API_KEY },
   });
   if (!res.ok) {
-    throw new Error(`Portainer API request failed (${res.status})`);
+    const body = await res.text().catch(() => "(unreadable)");
+    throw new Error(
+      `Portainer API ${res.status} on POST /api${path}: ${body.slice(0, 200)}`
+    );
   }
   // Restart returns 204 No Content
   if (res.status === 204) return { status: "ok" };
@@ -155,6 +160,65 @@ async function restartContainer(params: { container_name: string }): Promise<str
   return `Container "${params.container_name}" (${target.Id.slice(0, 12)}) restarted successfully.`;
 }
 
+// ── Tool: portainer-debug ──────────────────────────────────
+
+async function debugConnection(): Promise<string> {
+  const lines = [
+    "## Portainer MCP Debug Info",
+    "",
+    `PORTAINER_URL: ${PORTAINER_URL}`,
+    `ENVIRONMENT_ID: ${ENVIRONMENT_ID}`,
+    `API_KEY prefix: ${API_KEY.slice(0, 4)}...`,
+    `API_KEY length: ${API_KEY.length}`,
+    "",
+  ];
+
+  // Test 1: Portainer status (unauthenticated)
+  try {
+    const statusRes = await fetch(`${PORTAINER_URL}/api/system/status`);
+    const statusBody = await statusRes.text();
+    lines.push(`GET /api/system/status: ${statusRes.status} — ${statusBody.slice(0, 200)}`);
+  } catch (e) {
+    lines.push(`GET /api/system/status: FAILED — ${(e as Error).message}`);
+  }
+
+  // Test 2: Stacks endpoint (authenticated)
+  try {
+    const stacksRes = await fetch(`${PORTAINER_URL}/api/stacks`, {
+      headers: { "X-API-Key": API_KEY },
+    });
+    const stacksBody = await stacksRes.text();
+    lines.push(`GET /api/stacks: ${stacksRes.status} — ${stacksBody.slice(0, 200)}`);
+  } catch (e) {
+    lines.push(`GET /api/stacks: FAILED — ${(e as Error).message}`);
+  }
+
+  // Test 3: Endpoints list (authenticated)
+  try {
+    const endpointsRes = await fetch(`${PORTAINER_URL}/api/endpoints`, {
+      headers: { "X-API-Key": API_KEY },
+    });
+    const endpointsBody = await endpointsRes.text();
+    lines.push(`GET /api/endpoints: ${endpointsRes.status} — ${endpointsBody.slice(0, 300)}`);
+  } catch (e) {
+    lines.push(`GET /api/endpoints: FAILED — ${(e as Error).message}`);
+  }
+
+  // Test 4: Docker containers for configured environment
+  try {
+    const containersRes = await fetch(
+      `${PORTAINER_URL}/api/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`,
+      { headers: { "X-API-Key": API_KEY } },
+    );
+    const containersBody = await containersRes.text();
+    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: ${containersRes.status} — ${containersBody.slice(0, 200)}`);
+  } catch (e) {
+    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: FAILED — ${(e as Error).message}`);
+  }
+
+  return lines.join("\n");
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -178,6 +242,15 @@ function createServer(): McpServer {
     RestartInput,
     async (params) => ({
       content: [{ type: "text" as const, text: await restartContainer(params) }],
+    }),
+  );
+
+  server.tool(
+    "portainer-debug",
+    "Debug Portainer API connectivity. Tests status, auth, and endpoint access. No secrets exposed.",
+    {},
+    async () => ({
+      content: [{ type: "text" as const, text: await debugConnection() }],
     }),
   );
 
