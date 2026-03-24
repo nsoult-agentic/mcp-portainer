@@ -49,34 +49,49 @@ const API_KEY = loadApiKey();
 
 async function portainerGet(path: string): Promise<unknown> {
   const url = `${PORTAINER_URL}/api${path}`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { "X-API-Key": API_KEY },
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "(unreadable)");
-    throw new Error(
-      `Portainer API ${res.status} on GET /api${path}: ${body.slice(0, 200)}`
-    );
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "X-API-Key": API_KEY },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      // Log full error to container stdout (only visible via Portainer logs)
+      const body = await res.text().catch(() => "(unreadable)");
+      console.error(`[portainer] GET /api${path}: ${res.status} — ${body.slice(0, 200)}`);
+      // Throw generic error — never include API response body in thrown message
+      throw new Error(`Portainer API error (${res.status})`);
+    }
+    return res.json();
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Portainer API error"))
+      throw err;
+    // Network/timeout errors may contain URLs — strip them
+    throw new Error("Portainer API request failed");
   }
-  return res.json();
 }
 
 async function portainerPost(path: string): Promise<unknown> {
   const url = `${PORTAINER_URL}/api${path}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "X-API-Key": API_KEY },
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "(unreadable)");
-    throw new Error(
-      `Portainer API ${res.status} on POST /api${path}: ${body.slice(0, 200)}`
-    );
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "X-API-Key": API_KEY },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "(unreadable)");
+      console.error(`[portainer] POST /api${path}: ${res.status} — ${body.slice(0, 200)}`);
+      throw new Error(`Portainer API error (${res.status})`);
+    }
+    // Restart returns 204 No Content
+    if (res.status === 204) return { status: "ok" };
+    return res.json();
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Portainer API error"))
+      throw err;
+    throw new Error("Portainer API request failed");
   }
-  // Restart returns 204 No Content
-  if (res.status === 204) return { status: "ok" };
-  return res.json();
 }
 
 // ── Tool: portainer-list-stacks ────────────────────────────
@@ -99,28 +114,32 @@ interface PortainerContainer {
 const ListStacksInput = {};
 
 async function listStacks(): Promise<string> {
-  const stacks = (await portainerGet("/stacks")) as PortainerStack[];
-  const containers = (await portainerGet(
-    `/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`
-  )) as PortainerContainer[];
+  try {
+    const stacks = (await portainerGet("/stacks")) as PortainerStack[];
+    const containers = (await portainerGet(
+      `/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`
+    )) as PortainerContainer[];
 
-  const stackLines = stacks.map((s) => {
-    const statusLabel = s.Status === 1 ? "active" : s.Status === 2 ? "inactive" : `status:${s.Status}`;
-    return `  ${s.Name} (id:${s.Id}) — ${statusLabel}`;
-  });
+    const stackLines = stacks.map((s) => {
+      const statusLabel = s.Status === 1 ? "active" : s.Status === 2 ? "inactive" : `status:${s.Status}`;
+      return `  ${s.Name} (id:${s.Id}) — ${statusLabel}`;
+    });
 
-  const containerLines = containers.map((c) => {
-    const name = c.Names[0]?.replace(/^\//, "") ?? "unnamed";
-    return `  ${name} — ${c.State} (${c.Status}) [${c.Image}]`;
-  });
+    const containerLines = containers.map((c) => {
+      const name = c.Names[0]?.replace(/^\//, "") ?? "unnamed";
+      return `  ${name} — ${c.State} (${c.Status}) [${c.Image}]`;
+    });
 
-  return [
-    `## Stacks (${stacks.length})`,
-    ...stackLines,
-    "",
-    `## Containers (${containers.length})`,
-    ...containerLines,
-  ].join("\n");
+    return [
+      `## Stacks (${stacks.length})`,
+      ...stackLines,
+      "",
+      `## Containers (${containers.length})`,
+      ...containerLines,
+    ].join("\n");
+  } catch {
+    return "Failed to list stacks — Portainer API error. Check container logs for details.";
+  }
 }
 
 // ── Tool: portainer-restart ────────────────────────────────
@@ -136,28 +155,32 @@ const RestartInput = {
 };
 
 async function restartContainer(params: { container_name: string }): Promise<string> {
-  // Find container by name
-  const containers = (await portainerGet(
-    `/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`
-  )) as PortainerContainer[];
+  try {
+    // Find container by name
+    const containers = (await portainerGet(
+      `/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`
+    )) as PortainerContainer[];
 
-  const target = containers.find((c) =>
-    c.Names.some((n) => n === `/${params.container_name}` || n === params.container_name)
-  );
+    const target = containers.find((c) =>
+      c.Names.some((n) => n === `/${params.container_name}` || n === params.container_name)
+    );
 
-  if (!target) {
-    const available = containers
-      .map((c) => c.Names[0]?.replace(/^\//, ""))
-      .filter(Boolean)
-      .join(", ");
-    return `Container "${params.container_name}" not found. Available: ${available}`;
+    if (!target) {
+      const available = containers
+        .map((c) => c.Names[0]?.replace(/^\//, ""))
+        .filter(Boolean)
+        .join(", ");
+      return `Container "${params.container_name}" not found. Available: ${available}`;
+    }
+
+    await portainerPost(
+      `/endpoints/${ENVIRONMENT_ID}/docker/containers/${target.Id}/restart`
+    );
+
+    return `Container "${params.container_name}" (${target.Id.slice(0, 12)}) restarted successfully.`;
+  } catch {
+    return `Failed to restart "${params.container_name}" — Portainer API error. Check container logs for details.`;
   }
-
-  await portainerPost(
-    `/endpoints/${ENVIRONMENT_ID}/docker/containers/${target.Id}/restart`
-  );
-
-  return `Container "${params.container_name}" (${target.Id.slice(0, 12)}) restarted successfully.`;
 }
 
 // ── Tool: portainer-debug ──────────────────────────────────
@@ -168,52 +191,40 @@ async function debugConnection(): Promise<string> {
     "",
     `PORTAINER_URL: ${PORTAINER_URL}`,
     `ENVIRONMENT_ID: ${ENVIRONMENT_ID}`,
-    `API_KEY prefix: ${API_KEY.slice(0, 4)}...`,
-    `API_KEY length: ${API_KEY.length}`,
+    `API_KEY: ${API_KEY ? "loaded" : "NOT LOADED"}`,
     "",
   ];
 
   // Test 1: Portainer status (unauthenticated)
   try {
-    const statusRes = await fetch(`${PORTAINER_URL}/api/system/status`);
-    const statusBody = await statusRes.text();
-    lines.push(`GET /api/system/status: ${statusRes.status} — ${statusBody.slice(0, 200)}`);
-  } catch (e) {
-    lines.push(`GET /api/system/status: FAILED — ${(e as Error).message}`);
+    const statusRes = await fetch(`${PORTAINER_URL}/api/system/status`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    lines.push(`GET /api/system/status: ${statusRes.status}`);
+  } catch {
+    lines.push("GET /api/system/status: FAILED — connection error");
   }
 
   // Test 2: Stacks endpoint (authenticated)
   try {
     const stacksRes = await fetch(`${PORTAINER_URL}/api/stacks`, {
       headers: { "X-API-Key": API_KEY },
+      signal: AbortSignal.timeout(5_000),
     });
-    const stacksBody = await stacksRes.text();
-    lines.push(`GET /api/stacks: ${stacksRes.status} — ${stacksBody.slice(0, 200)}`);
-  } catch (e) {
-    lines.push(`GET /api/stacks: FAILED — ${(e as Error).message}`);
+    lines.push(`GET /api/stacks: ${stacksRes.status}`);
+  } catch {
+    lines.push("GET /api/stacks: FAILED — connection error");
   }
 
-  // Test 3: Endpoints list (authenticated)
-  try {
-    const endpointsRes = await fetch(`${PORTAINER_URL}/api/endpoints`, {
-      headers: { "X-API-Key": API_KEY },
-    });
-    const endpointsBody = await endpointsRes.text();
-    lines.push(`GET /api/endpoints: ${endpointsRes.status} — ${endpointsBody.slice(0, 300)}`);
-  } catch (e) {
-    lines.push(`GET /api/endpoints: FAILED — ${(e as Error).message}`);
-  }
-
-  // Test 4: Docker containers for configured environment
+  // Test 3: Docker containers for configured environment
   try {
     const containersRes = await fetch(
       `${PORTAINER_URL}/api/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`,
-      { headers: { "X-API-Key": API_KEY } },
+      { headers: { "X-API-Key": API_KEY }, signal: AbortSignal.timeout(5_000) },
     );
-    const containersBody = await containersRes.text();
-    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: ${containersRes.status} — ${containersBody.slice(0, 200)}`);
-  } catch (e) {
-    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: FAILED — ${(e as Error).message}`);
+    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: ${containersRes.status}`);
+  } catch {
+    lines.push(`GET /api/endpoints/${ENVIRONMENT_ID}/docker/containers: FAILED — connection error`);
   }
 
   return lines.join("\n");
