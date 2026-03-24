@@ -9,7 +9,7 @@
 
 services:
   mcp-portainer:
-    image: ghcr.io/nsoult-agentic/mcp-portainer:sha-2068cfa
+    image: ghcr.io/nsoult-agentic/mcp-portainer:sha-20d93fa
     container_name: mcp-portainer
     restart: unless-stopped
 
