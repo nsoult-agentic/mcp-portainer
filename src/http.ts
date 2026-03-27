@@ -307,3 +307,7 @@ process.on("SIGINT", () => {
   httpServer.stop();
   process.exit(0);
 });
+process.on("SIGTERM", () => {
+  httpServer.stop();
+  process.exit(0);
+});
