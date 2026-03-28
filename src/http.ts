@@ -25,6 +25,13 @@ const SECRETS_DIR = process.env["SECRETS_DIR"] || "/secrets";
 const PORTAINER_URL = process.env["PORTAINER_URL"] || "http://host.docker.internal:9000";
 const ENVIRONMENT_ID = process.env["PORTAINER_ENV_ID"] || "2";
 
+// Optional allowlist — restricts which containers can be restarted.
+// Comma-separated names. Empty = all containers allowed (backwards compatible).
+const RESTART_ALLOWLIST = (process.env["RESTART_ALLOWLIST"] || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 // Read API key from file (NEVER from env var)
 function loadApiKey(): string {
   const keyPath = resolve(SECRETS_DIR, "api-key");
@@ -41,6 +48,23 @@ function loadApiKey(): string {
 }
 
 const API_KEY = loadApiKey();
+
+// ── Rate Limiter ──────────────────────────────────────────
+
+const RATE_LIMIT = 30; // max requests per window
+const RATE_WINDOW_MS = 60_000; // 1 minute
+const requestTimestamps: number[] = [];
+
+function isRateLimited(): boolean {
+  const now = Date.now();
+  // Remove timestamps outside the window
+  while (requestTimestamps.length > 0 && requestTimestamps[0] < now - RATE_WINDOW_MS) {
+    requestTimestamps.shift();
+  }
+  if (requestTimestamps.length >= RATE_LIMIT) return true;
+  requestTimestamps.push(now);
+  return false;
+}
 
 // ── Portainer API Client ───────────────────────────────────
 
@@ -173,6 +197,11 @@ async function restartContainer(params: { container_name: string }): Promise<str
       return `Container "${params.container_name}" not found. Available: ${available}`;
     }
 
+    // Enforce allowlist if configured
+    if (RESTART_ALLOWLIST.length > 0 && !RESTART_ALLOWLIST.includes(params.container_name)) {
+      return `Container "${params.container_name}" is not in the restart allowlist.`;
+    }
+
     await portainerPost(
       `/endpoints/${ENVIRONMENT_ID}/docker/containers/${target.Id}/restart`
     );
@@ -283,6 +312,9 @@ const httpServer = Bun.serve({
     }
 
     if (url.pathname === "/mcp") {
+      if (isRateLimited()) {
+        return new Response("Rate limit exceeded", { status: 429 });
+      }
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined, // stateless
       });
