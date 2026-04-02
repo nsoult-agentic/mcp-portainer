@@ -6,9 +6,9 @@
  *   portainer-list-stacks  — List all stacks with status
  *   portainer-restart      — Restart a container by name
  *
- * SECURITY: This server has NO create, inspect, exec, or logs capability.
- * Portainer API key = root access via Docker socket. Restricting to
- * list + restart prevents credential exposure and container escape.
+ * SECURITY: Portainer API key = root access via Docker socket.
+ * Only list, restart, debug, and logs (tail, read-only) are exposed.
+ * No create, inspect, exec, delete, or shell capability.
  *
  * Usage: PORT=8900 SECRETS_DIR=/secrets bun run src/http.ts
  */
@@ -116,6 +116,62 @@ async function portainerPost(path: string): Promise<unknown> {
       throw err;
     throw new Error("Portainer API request failed");
   }
+}
+
+async function portainerGetRaw(path: string): Promise<ArrayBuffer> {
+  const url = `${PORTAINER_URL}/api${path}`;
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "X-API-Key": API_KEY },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "(unreadable)");
+      console.error(`[portainer] GET /api${path}: ${res.status} — ${body.slice(0, 200)}`);
+      throw new Error(`Portainer API error (${res.status})`);
+    }
+    return res.arrayBuffer();
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Portainer API error"))
+      throw err;
+    throw new Error("Portainer API request failed");
+  }
+}
+
+/** Demux Docker multiplexed stream format (8-byte header per frame). */
+function demuxDockerLogs(buf: Uint8Array): string {
+  if (buf.length === 0) return "(empty)";
+  // Detect multiplexed format: first byte is stream type (0-2), bytes 1-3 are zero padding
+  if (buf.length >= 8 && buf[0] <= 2 && buf[1] === 0 && buf[2] === 0 && buf[3] === 0) {
+    const chunks: string[] = [];
+    const decoder = new TextDecoder();
+    let offset = 0;
+    while (offset + 8 <= buf.length) {
+      const frameSize = (buf[offset + 4] << 24) | (buf[offset + 5] << 16) |
+                        (buf[offset + 6] << 8) | buf[offset + 7];
+      offset += 8;
+      if (frameSize <= 0 || offset + frameSize > buf.length) break;
+      chunks.push(decoder.decode(buf.slice(offset, offset + frameSize)));
+      offset += frameSize;
+    }
+    return chunks.join("") || "(empty)";
+  }
+  // Plain text (TTY mode)
+  return new TextDecoder().decode(buf);
+}
+
+const SENSITIVE_PATTERNS = [
+  /Bearer\s+[A-Za-z0-9._\-]{20,}/gi,
+  /["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?[^\s"',]{8,}["']?/gi,
+];
+
+function sanitizeLogs(text: string): string {
+  let result = text;
+  for (const pattern of SENSITIVE_PATTERNS) {
+    result = result.replace(pattern, "[REDACTED]");
+  }
+  return result;
 }
 
 // ── Tool: portainer-list-stacks ────────────────────────────
@@ -259,6 +315,53 @@ async function debugConnection(): Promise<string> {
   return lines.join("\n");
 }
 
+// ── Tool: portainer-logs ──────────────────────────────────
+
+const LogsInput = {
+  container_name: z.string()
+    .min(1)
+    .max(128)
+    .regex(CONTAINER_NAME_REGEX, "Container name must be alphanumeric with dashes, dots, or underscores")
+    .describe("Name of the container to fetch logs from (e.g., 'mcp-accounting')"),
+  lines: z.number()
+    .int()
+    .min(1)
+    .max(500)
+    .default(100)
+    .describe("Number of recent log lines to return (default: 100, max: 500)"),
+};
+
+async function getContainerLogs(params: { container_name: string; lines: number }): Promise<string> {
+  try {
+    const containers = (await portainerGet(
+      `/endpoints/${ENVIRONMENT_ID}/docker/containers/json?all=true`
+    )) as PortainerContainer[];
+
+    const target = containers.find((c) =>
+      c.Names.some((n) => n === `/${params.container_name}` || n === params.container_name)
+    );
+
+    if (!target) {
+      const available = containers
+        .map((c) => c.Names[0]?.replace(/^\//, ""))
+        .filter(Boolean)
+        .join(", ");
+      return `Container "${params.container_name}" not found. Available: ${available}`;
+    }
+
+    const raw = await portainerGetRaw(
+      `/endpoints/${ENVIRONMENT_ID}/docker/containers/${target.Id}/logs?stdout=1&stderr=1&tail=${params.lines}&timestamps=1`
+    );
+
+    const text = demuxDockerLogs(new Uint8Array(raw));
+    const sanitized = sanitizeLogs(text);
+
+    return `## Logs: ${params.container_name} (last ${params.lines} lines)\n\n${sanitized}`;
+  } catch {
+    return `Failed to fetch logs for "${params.container_name}" — Portainer API error.`;
+  }
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -291,6 +394,15 @@ function createServer(): McpServer {
     {},
     async () => ({
       content: [{ type: "text" as const, text: await debugConnection() }],
+    }),
+  );
+
+  server.tool(
+    "portainer-logs",
+    "Fetch recent logs from a Docker container. Output is sanitized — sensitive values are redacted.",
+    LogsInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await getContainerLogs(params) }],
     }),
   );
 
@@ -328,7 +440,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-portainer listening on http://0.0.0.0:${PORT}/mcp`);
-console.log(`Tools: portainer-list-stacks, portainer-restart (READ-ONLY)`);
+console.log(`Tools: portainer-list-stacks, portainer-restart, portainer-debug, portainer-logs`);
 
 process.on("SIGTERM", () => {
   httpServer.stop();
