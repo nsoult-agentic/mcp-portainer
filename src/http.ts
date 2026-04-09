@@ -222,7 +222,13 @@ function sanitizeLogs(text: string): string {
 function sanitizeComposeFile(text: string): string {
   let result = text;
   for (const pattern of COMPOSE_SENSITIVE_PATTERNS) {
-    result = result.replace(pattern, "[REDACTED]");
+    result = result.replace(pattern, (match) => {
+      // Preserve ${VARIABLE} references — these are not actual secret values
+      if (/\$\{[A-Z_]+\}/.test(match)) return match;
+      // Preserve $VARIABLE references
+      if (/\$[A-Z_]+/.test(match) && !/[:\/]/.test(match)) return match;
+      return "[REDACTED]";
+    });
   }
   return result;
 }
