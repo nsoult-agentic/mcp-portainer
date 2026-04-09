@@ -5,10 +5,14 @@
  * Tools:
  *   portainer-list-stacks  — List all stacks with status
  *   portainer-restart      — Restart a container by name
+ *   portainer-debug        — Test API connectivity
+ *   portainer-logs         — Fetch container logs (sanitized)
+ *   portainer-stack-file   — Get docker-compose.yml for a stack
  *
  * SECURITY: Portainer API key = root access via Docker socket.
- * Only list, restart, debug, and logs (tail, read-only) are exposed.
+ * Only list, restart, debug, logs (tail, read-only), and stack-file (read-only) are exposed.
  * No create, inspect, exec, delete, or shell capability.
+ * Stack file content is sanitized — passwords/secrets are redacted.
  *
  * Usage: PORT=8900 SECRETS_DIR=/secrets bun run src/http.ts
  */
@@ -166,9 +170,30 @@ const SENSITIVE_PATTERNS = [
   /["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?[^\s"',]{8,}["']?/gi,
 ];
 
+// Extended patterns for docker-compose files (keys, credentials, connection strings)
+const COMPOSE_SENSITIVE_PATTERNS = [
+  ...SENSITIVE_PATTERNS,
+  // Key-value pairs with sensitive key names not covered by base patterns
+  /["']?(?:PRIVATE_KEY|SIGNING_KEY|ENCRYPTION_KEY|ACCESS_KEY|SECRET_KEY|CLIENT_SECRET|CERT_KEY|CREDENTIALS|PASSPHRASE|SMTP_PASS|DB_PASS|AWS_ACCESS_KEY_ID)["']?\s*[:=]\s*["']?[^\s"',]{4,}["']?/gi,
+  // Connection strings with embedded credentials
+  /(?:postgres|postgresql|mysql|redis|mongodb|amqp|smtp):\/\/[^\s"']+/gi,
+  // AWS access key IDs
+  /AKIA[0-9A-Z]{16}/g,
+  // PEM-encoded keys/certs (BEGIN blocks)
+  /-----BEGIN\s+(?:RSA\s+)?(?:PRIVATE\s+KEY|CERTIFICATE|EC\s+PRIVATE\s+KEY)-----[\s\S]*?-----END\s+[A-Z\s]+-----/gi,
+];
+
 function sanitizeLogs(text: string): string {
   let result = text;
   for (const pattern of SENSITIVE_PATTERNS) {
+    result = result.replace(pattern, "[REDACTED]");
+  }
+  return result;
+}
+
+function sanitizeComposeFile(text: string): string {
+  let result = text;
+  for (const pattern of COMPOSE_SENSITIVE_PATTERNS) {
     result = result.replace(pattern, "[REDACTED]");
   }
   return result;
@@ -362,6 +387,34 @@ async function getContainerLogs(params: { container_name: string; lines: number 
   }
 }
 
+// ── Tool: portainer-stack-file ────────────────────────────
+
+const StackFileInput = {
+  stack_id: z.number()
+    .int()
+    .min(1)
+    .describe("Stack ID (use portainer-list-stacks to find IDs)"),
+};
+
+async function getStackFile(params: { stack_id: number }): Promise<string> {
+  try {
+    const data = (await portainerGet(`/stacks/${params.stack_id}/file`)) as {
+      StackFileContent?: string;
+    };
+
+    if (!data.StackFileContent) {
+      return `Stack ${params.stack_id}: no compose file content returned.`;
+    }
+
+    // Sanitize: redact passwords/secrets in compose files (extended patterns)
+    const sanitized = sanitizeComposeFile(data.StackFileContent);
+
+    return `## Stack ${params.stack_id} — docker-compose.yml\n\n\`\`\`yaml\n${sanitized}\n\`\`\``;
+  } catch {
+    return `Failed to fetch stack file for stack ${params.stack_id} — Portainer API error.`;
+  }
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -406,6 +459,15 @@ function createServer(): McpServer {
     }),
   );
 
+  server.tool(
+    "portainer-stack-file",
+    "Get the docker-compose.yml content for a Portainer stack by stack ID. Use portainer-list-stacks to find IDs.",
+    StackFileInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await getStackFile(params) }],
+    }),
+  );
+
   return server;
 }
 
@@ -440,7 +502,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-portainer listening on http://0.0.0.0:${PORT}/mcp`);
-console.log(`Tools: portainer-list-stacks, portainer-restart, portainer-debug, portainer-logs`);
+console.log(`Tools: portainer-list-stacks, portainer-restart, portainer-debug, portainer-logs, portainer-stack-file`);
 
 process.on("SIGTERM", () => {
   httpServer.stop();
