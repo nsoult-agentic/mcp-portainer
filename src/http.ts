@@ -8,9 +8,11 @@
  *   portainer-debug        — Test API connectivity
  *   portainer-logs         — Fetch container logs (sanitized)
  *   portainer-stack-file   — Get docker-compose.yml for a stack
+ *   portainer-stack-update — Update compose and redeploy (DESTRUCTIVE — not auto-approved)
  *
  * SECURITY: Portainer API key = root access via Docker socket.
- * Only list, restart, debug, logs (tail, read-only), and stack-file (read-only) are exposed.
+ * Read tools: list, debug, logs, stack-file (auto-approved).
+ * Write tools: restart, stack-update (require user permission — NOT in allowlist).
  * No create, inspect, exec, delete, or shell capability.
  * Stack file content is sanitized — passwords/secrets are redacted.
  *
@@ -113,6 +115,32 @@ async function portainerPost(path: string): Promise<unknown> {
       throw new Error(`Portainer API error (${res.status})`);
     }
     // Restart returns 204 No Content
+    if (res.status === 204) return { status: "ok" };
+    return res.json();
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Portainer API error"))
+      throw err;
+    throw new Error("Portainer API request failed");
+  }
+}
+
+async function portainerPut(path: string, body: unknown): Promise<unknown> {
+  const url = `${PORTAINER_URL}/api${path}`;
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "X-API-Key": API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000), // Longer timeout for redeploys
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "(unreadable)");
+      console.error(`[portainer] PUT /api${path}: ${res.status} — ${text.slice(0, 200)}`);
+      throw new Error(`Portainer API error (${res.status})`);
+    }
     if (res.status === 204) return { status: "ok" };
     return res.json();
   } catch (err: unknown) {
@@ -415,6 +443,78 @@ async function getStackFile(params: { stack_id: number }): Promise<string> {
   }
 }
 
+// ── Tool: portainer-stack-update ──────────────────────────
+
+const StackUpdateInput = {
+  stack_id: z.number()
+    .int()
+    .min(1)
+    .describe("Stack ID (use portainer-list-stacks to find IDs)"),
+  compose: z.string()
+    .min(10)
+    .max(50000)
+    .describe("New docker-compose.yml content (full YAML)"),
+};
+
+async function updateStack(params: { stack_id: number; compose: string }): Promise<string> {
+  try {
+    // Step 1: Fetch current compose for diff
+    const current = (await portainerGet(`/stacks/${params.stack_id}/file`)) as {
+      StackFileContent?: string;
+    };
+    const oldCompose = current?.StackFileContent || "(unable to fetch current)";
+
+    // Step 2: Generate a simple diff summary
+    const oldLines = oldCompose.split("\n");
+    const newLines = params.compose.split("\n");
+    const removed = oldLines.filter((l) => !newLines.includes(l) && l.trim() !== "");
+    const added = newLines.filter((l) => !oldLines.includes(l) && l.trim() !== "");
+
+    // Step 3: Fetch stack details to get endpointId
+    const stacks = (await portainerGet("/stacks")) as Array<{
+      Id: number;
+      Name: string;
+      EndpointId: number;
+    }>;
+    const stack = stacks.find((s) => s.Id === params.stack_id);
+    if (!stack) {
+      return `Stack ${params.stack_id} not found.`;
+    }
+
+    // Step 4: Update the stack
+    await portainerPut(
+      `/stacks/${params.stack_id}?endpointId=${stack.EndpointId}`,
+      {
+        stackFileContent: params.compose,
+        prune: false,
+        pullImage: true,
+      },
+    );
+
+    // Step 5: Build response with sanitized diff
+    const diffLines: string[] = [];
+    if (removed.length > 0) {
+      diffLines.push("**Removed:**");
+      for (const l of removed) diffLines.push(`- \`${sanitizeComposeFile(l.trim())}\``);
+    }
+    if (added.length > 0) {
+      diffLines.push("**Added:**");
+      for (const l of added) diffLines.push(`+ \`${sanitizeComposeFile(l.trim())}\``);
+    }
+
+    return [
+      `## Stack "${stack.Name}" (ID ${params.stack_id}) — Updated and Redeployed`,
+      "",
+      diffLines.length > 0 ? diffLines.join("\n") : "No visible diff (whitespace or formatting change only)",
+      "",
+      "Stack has been redeployed with the new configuration.",
+    ].join("\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "unknown error";
+    return `Failed to update stack ${params.stack_id}: ${msg}`;
+  }
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -468,6 +568,15 @@ function createServer(): McpServer {
     }),
   );
 
+  server.tool(
+    "portainer-stack-update",
+    "Update a Portainer stack's docker-compose.yml and redeploy. DESTRUCTIVE — pulls new images and recreates containers. Shows diff of changes.",
+    StackUpdateInput,
+    async (params) => ({
+      content: [{ type: "text" as const, text: await updateStack(params) }],
+    }),
+  );
+
   return server;
 }
 
@@ -502,7 +611,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-portainer listening on http://0.0.0.0:${PORT}/mcp`);
-console.log(`Tools: portainer-list-stacks, portainer-restart, portainer-debug, portainer-logs, portainer-stack-file`);
+console.log(`Tools: portainer-list-stacks, portainer-restart, portainer-debug, portainer-logs, portainer-stack-file, portainer-stack-update`);
 
 process.on("SIGTERM", () => {
   httpServer.stop();
